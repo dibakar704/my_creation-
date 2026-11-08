@@ -1,66 +1,187 @@
+
 import os
+import base64
 import requests
+
 from dotenv import load_dotenv
 from .memory import Hindsight
 
 load_dotenv()
 
+
 class IncidentResponseAgent:
+
     def __init__(self):
         self.groq_api_key = os.getenv("GROQ_API_KEY")
-        self.memory = Hindsight()
         self.groq_url = "https://api.groq.com/openai/v1/chat/completions"
+        self.model = "qwen/qwen3.8-27b"
+        self.memory = Hindsight()
 
-    def handle_incident(self, incident_description):
-        print(f"\n[Agent] Analyzing incoming incident: {incident_description}")
+        if not self.groq_api_key:
+            raise ValueError("GROQ_API_KEY is missing")
 
-        # 1. Recall similar past incidents from memory
-        past_memories = []
+    def handle_incident(
+        self,
+        incident_description,
+        image_inputs=None,
+        log_texts=None
+    ):
+        print("\n[Agent] Analyzing incident:", incident_description)
+
+        image_inputs = image_inputs or []
+        log_texts = log_texts or []
+
         try:
-            recalled = self.memory.recall(query=incident_description, limit=2)
-            if hasattr(recalled, 'results'):
-                past_memories = [r.text for r in recalled.results]
-        except Exception as e:
-            print(f"[Agent] Memory recall warning: {e}")
+            # 1. Retrieve historical incident context
+            past_memories = []
 
-        # 2. Build prompt with context
-        prompt = f"""
-You are an expert Autonomous Incident Response Agent.
-New Incident Alert: {incident_description}
-Relevant Past Incidents: {past_memories}
+            try:
+                recalled = self.memory.recall(
+                    query=incident_description,
+                    limit=3
+                )
 
-Provide a concise, step-by-step remediation plan for this incident:
+                if hasattr(recalled, "results"):
+                    past_memories = [
+                        item.text for item in recalled.results
+                    ]
+
+            except Exception as error:
+                print("[Agent] Memory recall warning:", error)
+
+            # 2. Combine incident description and log evidence
+            evidence_text = "\n\n".join(
+                f"Log evidence {index + 1}:\n{log}"
+                for index, log in enumerate(log_texts)
+            )
+
+            prompt = f"""
+You are RunBook AI, an expert incident response assistant.
+
+INCIDENT DESCRIPTION:
+{incident_description}
+
+UPLOADED LOG EVIDENCE:
+{evidence_text if evidence_text else "No log files uploaded."}
+
+RELEVANT HISTORICAL INCIDENTS:
+{past_memories if past_memories else "No relevant past incidents found."}
+
+IMAGE EVIDENCE:
+Analyze all attached screenshots. Extract visible errors,
+timestamps, metrics, service names and warning messages.
+
+TASK:
+1. Identify the likely root cause.
+2. Separate confirmed evidence from hypotheses.
+3. Use relevant historical incidents where applicable.
+4. Provide immediate mitigation steps.
+5. Provide permanent corrective actions.
+6. Provide verification and monitoring steps.
+7. Never invent configuration values or claim an action
+   has been performed.
+8. Require human approval before production changes.
+
+Clearly explain which recommendations are supported
+by historical incidents.
+
+Generate a structured, practical remediation plan.
 """
 
-        # 3. Query Groq Qwen Model
-        headers = {
-            "Authorization": f"Bearer {self.groq_api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "qwen/qwen3.8-27b",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3
-        }
+            # 3. Construct multimodal message
+            content = [
+                {
+                    "type": "text",
+                    "text": prompt
+                }
+            ]
 
-        try:
-            response = requests.post(self.groq_url, json=payload, headers=headers)
-            if response.status_code == 200:
-                result_json = response.json()
-                remediation_plan = result_json["choices"][0]["message"]["content"]
-                
-                # 4. Store incident in memory
-                self.memory.retain(text=incident_description, metadata={"plan": remediation_plan})
-                print("\n[Agent] Remediation Plan:\n" + remediation_plan)
-                print("\n[Agent] Incident successfully processed and stored in memory!")
-                return remediation_plan
-            else:
-                print(f"[Agent] Groq API Error: {response.text}")
-        except Exception as e:
-            print(f"[Agent] Error during execution: {e}")
+            for mime_type, image_bytes in image_inputs:
+                encoded_image = base64.b64encode(
+                    image_bytes
+                ).decode("utf-8")
+
+                content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": (
+                            f"data:{mime_type};base64,"
+                            f"{encoded_image}"
+                        )
+                    }
+                })
+
+            # 4. Call Groq
+            message_content = (
+                content if image_inputs else prompt
+            )
+
+            headers = {
+                "Authorization": f"Bearer {self.groq_api_key}",
+                "Content-Type": "application/json"
+            }
+
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": message_content
+                    }
+                ],
+                "temperature": 0.3
+            }
+
+            response = requests.post(
+                self.groq_url,
+                json=payload,
+                headers=headers,
+                timeout=90
+            )
+
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Groq API error {response.status_code}: "
+                    f"{response.text[:1000]}"
+                )
+
+            result = response.json()
+
+            remediation_plan = (
+                result["choices"][0]["message"]["content"]
+            )
+
+            if not remediation_plan:
+                raise RuntimeError(
+                    "Groq returned an empty remediation plan."
+                )
+
+            # 5. Retain incident context in Hindsight
+            self.memory.retain(
+                text=(
+                    f"Incident: {incident_description}\n"
+                    f"Log evidence: {evidence_text}\n"
+                    f"Remediation plan: {remediation_plan}"
+                ),
+                metadata={
+                    "record_type": "incident",
+                    "plan": remediation_plan
+                }
+            )
+
+            print("\n[Agent] Remediation plan generated.")
+            return remediation_plan
+
         finally:
             self.memory.close()
 
+
 if __name__ == "__main__":
     agent = IncidentResponseAgent()
-    agent.handle_incident("High CPU utilization spike detected on production server cluster-01.")
+
+    try:
+        agent.handle_incident(
+            "High CPU utilization spike detected on production server."
+        )
+    finally:
+        pass
